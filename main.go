@@ -1,29 +1,35 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
+	"github.com/cert-manager/webhook-example/internal/unifi"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+	"k8s.io/client-go/kubernetes"
 	"os"
+	"regexp"
+	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/plan"
+	"sigs.k8s.io/external-dns/provider"
 
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/client-go/rest"
 
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
-	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
 )
 
 var GroupName = os.Getenv("GROUP_NAME")
+var logger, _ = zap.NewProduction()
 
 func main() {
+	GroupName = "unifi"
 	if GroupName == "" {
 		panic("GROUP_NAME must be specified")
 	}
 
-	// This will register our custom DNS provider with the webhook serving
-	// library, making it available as an API under the provided GroupName.
-	// You can register multiple DNS provider implementations with a single
-	// webhook, where the Name() method will be used to disambiguate between
-	// the different implementations.
 	cmd.RunWebhookServer(GroupName,
 		&customDNSProviderSolver{},
 	)
@@ -40,7 +46,8 @@ type customDNSProviderSolver struct {
 	// 3. uncomment the relevant code in the Initialize method below
 	// 4. ensure your webhook's service account has the required RBAC role
 	//    assigned to it for interacting with the Kubernetes APIs you need.
-	//client kubernetes.Clientset
+	client      *kubernetes.Clientset
+	unifiClient provider.Provider
 }
 
 // customDNSProviderConfig is a structure that is used to decode into when
@@ -74,7 +81,7 @@ type customDNSProviderConfig struct {
 // within a single webhook deployment**.
 // For example, `cloudflare` may be used as the name of a solver.
 func (c *customDNSProviderSolver) Name() string {
-	return "my-custom-solver"
+	return "unifi"
 }
 
 // Present is responsible for actually presenting the DNS record with the
@@ -89,9 +96,23 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	}
 
 	// TODO: do something more useful with the decoded configuration
-	fmt.Printf("Decoded configuration %v", cfg)
+	logger.Sugar().Infof("Decoded configuration %v", cfg)
 
-	// TODO: add code that sets a record in the DNS provider's console
+	err = c.unifiClient.ApplyChanges(context.Background(), &plan.Changes{
+		Create: []*endpoint.Endpoint{
+			{
+				DNSName:    ch.DNSName,
+				RecordType: endpoint.RecordTypeTXT,
+				Targets:    endpoint.Targets{ch.Key},
+			},
+		},
+	})
+
+	if err != nil {
+		logger.Error("error applying changes", zap.Error(err))
+		return err
+	}
+
 	return nil
 }
 
@@ -103,6 +124,21 @@ func (c *customDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 // concurrently.
 func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	// TODO: add code that deletes a record from the DNS provider's console
+	e := []*endpoint.Endpoint{
+		{
+			DNSName:    ch.DNSName,
+			RecordType: endpoint.RecordTypeTXT,
+			Targets:    endpoint.Targets{ch.Key},
+		},
+	}
+
+	err := c.unifiClient.ApplyChanges(context.Background(), &plan.Changes{
+		Delete: e,
+	})
+	if err != nil {
+		return errors.Wrap(err, "error deleting challenge")
+	}
+
 	return nil
 }
 
@@ -115,16 +151,31 @@ func (c *customDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 // provider accounts.
 // The stopCh can be used to handle early termination of the webhook, in cases
 // where a SIGTERM or similar signal is sent to the webhook process.
-func (c *customDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
+func (c *customDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, _ <-chan struct{}) error {
 	///// UNCOMMENT THE BELOW CODE TO MAKE A KUBERNETES CLIENTSET AVAILABLE TO
 	///// YOUR CUSTOM DNS PROVIDER
 
-	//cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//c.client = cl
+	cl, err := kubernetes.NewForConfig(kubeClientConfig)
+	if err != nil {
+		return err
+	}
+
+	c.client = cl
+
+	includeRegex := regexp.MustCompile("^.*\\.local\\.marloncalvo\\.com$")
+	domainFilter := endpoint.NewRegexDomainFilter(includeRegex, nil)
+	unifiClient, err := unifi.NewUnifiProvider(domainFilter, &unifi.Config{
+		Host:          "192.168.1.1",
+		User:          "k8-unifi-cert-manager-webhook",
+		Password:      "Alphadog32!!",
+		SkipTLSVerify: true,
+		Site:          "default",
+	})
+	if err != nil {
+		return errors.Wrap(err, "error initializing unifi client")
+	}
+
+	c.unifiClient = unifiClient
 
 	///// END OF CODE TO MAKE KUBERNETES CLIENTSET AVAILABLE
 	return nil
